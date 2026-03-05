@@ -20,7 +20,7 @@ from sklearn.metrics import (accuracy_score, precision_score,
                              recall_score, f1_score, confusion_matrix)
 
 # =============================================================
-# CONFIG
+# CONFIG TEST RESULTS & FIGURE SETTINGS
 # =============================================================
 RESULT_DIR = "results"
 FIG_DIR    = "figures/comparison"
