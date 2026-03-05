@@ -1,13 +1,12 @@
 """
 =============================================================
-CDS525 Group Project — Model 1: BiLSTM
+CDS525 Group Project — Model 2: BERT + BiLSTM
 Fake News Detection
 =============================================================
-Run this file first, then run bert_bilstm_fakenews.py,
-finally run compare_models.py to see the comparison.
+Run AFTER bilstm_fakenews.py, then run compare_models.py.
 
 Install:
-    pip install torch scikit-learn pandas matplotlib tqdm
+    pip install torch transformers scikit-learn pandas matplotlib tqdm
 =============================================================
 """
 
@@ -17,7 +16,6 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from collections import Counter
 from tqdm import tqdm
 
 import torch
@@ -26,16 +24,22 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
+from transformers import BertTokenizer, BertModel
 
 # =============================================================
 # ★ CONFIG
 # =============================================================
 DEVICE_MODE = "auto"    # "auto" | "cuda" | "cpu"
-SEED        = 42
-EPOCHS      = 15
+SEED        = 42        # Keep same as bilstm_fakenews.py!
+EPOCHS      = 10        # BERT converges faster than BiLSTM
 CSV_PATH    = "fakenews.csv"
-SAVE_DIR    = "results"          # JSON results saved here
-FIG_DIR     = "figures/bilstm"   # Figures saved here
+SAVE_DIR    = "results"
+FIG_DIR     = "figures/bert_bilstm"
+
+# BERT memory tip:
+#   freeze_bert=True  → freeze all BERT layers (fast, lower accuracy)
+#   freeze_bert=False → fine-tune last 2 BERT layers (recommended)
+FREEZE_BERT = False
 # =============================================================
 
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
@@ -53,11 +57,12 @@ def get_device(mode):
     else:
         device = torch.device("cpu")
     print(f"\n{'='*50}")
-    print(f"  [BiLSTM] Device : {device}")
+    print(f"  [BERT+BiLSTM] Device : {device}")
     if device.type == "cuda":
         print(f"  GPU : {torch.cuda.get_device_name(0)}")
         mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
         print(f"  Mem : {mem:.1f} GB")
+    print(f"  freeze_bert = {FREEZE_BERT}")
     print(f"{'='*50}\n")
     return device
 
@@ -94,58 +99,102 @@ def load_data(csv_path):
     return X_tr, X_va, X_te, y_tr, y_va, y_te
 
 
-def build_vocab(texts, max_vocab=20000):
-    counter = Counter(w for t in texts for w in t.split())
-    vocab = {"<PAD>": 0, "<UNK>": 1}
-    for w, _ in counter.most_common(max_vocab - 2):
-        vocab[w] = len(vocab)
-    return vocab
+# =============================================================
+# 2. DATASET
+# =============================================================
+
+class BertDataset(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_len=128):
+        self.texts     = texts
+        self.labels    = labels
+        self.tokenizer = tokenizer
+        self.max_len   = max_len
+
+    def __len__(self): return len(self.labels)
+
+    def __getitem__(self, idx):
+        enc = self.tokenizer(
+            self.texts[idx],
+            max_length=self.max_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
+        return {
+            "input_ids":      enc["input_ids"].squeeze(0),
+            "attention_mask": enc["attention_mask"].squeeze(0),
+            "label":          torch.tensor(self.labels[idx], dtype=torch.float)
+        }
 
 
-def encode(text, vocab, max_len=200):
-    ids = [vocab.get(w, 1) for w in text.split()[:max_len]]
-    return ids + [0] * (max_len - len(ids))
-
-
-class FakeNewsDataset(Dataset):
-    def __init__(self, texts, labels, vocab, max_len=200):
-        self.X = [encode(t, vocab, max_len) for t in texts]
-        self.y = labels
-    def __len__(self): return len(self.y)
-    def __getitem__(self, i):
-        return (torch.tensor(self.X[i], dtype=torch.long),
-                torch.tensor(self.y[i],  dtype=torch.float))
-
-
-def make_loaders(X_tr, X_va, X_te, y_tr, y_va, y_te, vocab, bs):
-    tr = DataLoader(FakeNewsDataset(X_tr, y_tr, vocab), batch_size=bs, shuffle=True)
-    va = DataLoader(FakeNewsDataset(X_va, y_va, vocab), batch_size=bs)
-    te = DataLoader(FakeNewsDataset(X_te, y_te, vocab), batch_size=bs)
+def make_loaders(X_tr, X_va, X_te, y_tr, y_va, y_te, tokenizer, bs):
+    tr = DataLoader(BertDataset(X_tr, y_tr, tokenizer), batch_size=bs, shuffle=True)
+    va = DataLoader(BertDataset(X_va, y_va, tokenizer), batch_size=bs)
+    te = DataLoader(BertDataset(X_te, y_te, tokenizer), batch_size=bs)
     return tr, va, te
 
 
 # =============================================================
-# 2. MODEL
+# 3. MODEL
 # =============================================================
 
-class BiLSTMClassifier(nn.Module):
-    """Embedding → BiLSTM → Attention → FC"""
-    def __init__(self, vocab_size, embed_dim=128, hidden_dim=256,
-                 num_layers=2, dropout=0.5):
+class BertBiLSTMClassifier(nn.Module):
+    """
+    BERT → BiLSTM → Masked Attention → FC → Sigmoid
+
+    Flow:
+        token ids  →  BERT (768-dim contextual embeddings)
+                   →  BiLSTM (captures sequential patterns)
+                   →  Attention pooling (focus on key tokens)
+                   →  FC + Sigmoid  →  REAL/FAKE
+    """
+    def __init__(self, bert_model_name="bert-base-uncased",
+                 hidden_dim=256, num_layers=2, dropout=0.3,
+                 freeze_bert=False):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers=num_layers,
+
+        # ── BERT ──────────────────────────────────────────
+        self.bert    = BertModel.from_pretrained(bert_model_name)
+        bert_dim     = self.bert.config.hidden_size   # 768
+
+        if freeze_bert:
+            for p in self.bert.parameters():
+                p.requires_grad = False
+        else:
+            # Fine-tune only last 2 transformer layers + pooler
+            for name, p in self.bert.named_parameters():
+                p.requires_grad = (
+                    any(f"layer.{i}" in name for i in [10, 11])
+                    or "pooler" in name
+                )
+
+        # ── BiLSTM ────────────────────────────────────────
+        self.lstm = nn.LSTM(bert_dim, hidden_dim, num_layers=num_layers,
                             batch_first=True, bidirectional=True,
                             dropout=dropout if num_layers > 1 else 0.0)
-        self.attention = nn.Linear(hidden_dim * 2, 1)
-        self.dropout   = nn.Dropout(dropout)
-        self.fc        = nn.Linear(hidden_dim * 2, 1)
 
-    def forward(self, x):
-        emb  = self.dropout(self.embedding(x))
-        out, _ = self.lstm(emb)
-        score  = torch.softmax(self.attention(out), dim=1)
-        ctx    = (score * out).sum(dim=1)
+        # ── Attention ─────────────────────────────────────
+        self.attention = nn.Linear(hidden_dim * 2, 1)
+
+        # ── Classifier ────────────────────────────────────
+        self.dropout = nn.Dropout(dropout)
+        self.fc      = nn.Linear(hidden_dim * 2, 1)
+
+    def forward(self, input_ids, attention_mask):
+        # BERT: (B, L, 768)
+        bert_out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        seq_out  = self.dropout(bert_out.last_hidden_state)
+
+        # BiLSTM: (B, L, 2H)
+        lstm_out, _ = self.lstm(seq_out)
+
+        # Masked attention — ignore [PAD] tokens
+        mask  = attention_mask.unsqueeze(-1).float()
+        score = self.attention(lstm_out)
+        score = score.masked_fill(mask == 0, -1e9)
+        score = torch.softmax(score, dim=1)
+        ctx   = (score * lstm_out).sum(dim=1)   # (B, 2H)
+
         return self.fc(self.dropout(ctx)).squeeze(1)
 
 
@@ -154,22 +203,24 @@ class FocalLoss(nn.Module):
         super().__init__()
         self.alpha, self.gamma = alpha, gamma
     def forward(self, logits, targets):
-        bce   = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-        pt    = torch.exp(-bce)
+        bce = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        pt  = torch.exp(-bce)
         return (self.alpha * (1 - pt) ** self.gamma * bce).mean()
 
 
 # =============================================================
-# 3. TRAIN / EVAL
+# 4. TRAIN / EVAL
 # =============================================================
 
 def train_epoch(model, loader, criterion, optimizer):
     model.train()
     total_loss, preds_all, labels_all = 0, [], []
-    for X, y in tqdm(loader, desc="  train", leave=False):
-        X, y = X.to(DEVICE), y.to(DEVICE)
+    for batch in tqdm(loader, desc="  train", leave=False):
+        ids  = batch["input_ids"].to(DEVICE)
+        mask = batch["attention_mask"].to(DEVICE)
+        y    = batch["label"].to(DEVICE)
         optimizer.zero_grad()
-        logits = model(X)
+        logits = model(ids, mask)
         loss   = criterion(logits, y)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -184,29 +235,31 @@ def train_epoch(model, loader, criterion, optimizer):
 def eval_epoch(model, loader, criterion):
     model.eval()
     total_loss, preds_all, labels_all = 0, [], []
-    for X, y in loader:
-        X, y   = X.to(DEVICE), y.to(DEVICE)
-        logits = model(X)
+    for batch in loader:
+        ids    = batch["input_ids"].to(DEVICE)
+        mask   = batch["attention_mask"].to(DEVICE)
+        y      = batch["label"].to(DEVICE)
+        logits = model(ids, mask)
         total_loss += criterion(logits, y).item() * len(y)
         preds_all.extend((torch.sigmoid(logits) > 0.5).long().cpu().tolist())
         labels_all.extend(y.long().cpu().tolist())
     return total_loss / len(loader.dataset), accuracy_score(labels_all, preds_all), preds_all, labels_all
 
 
-def run_experiment(X_tr, X_va, X_te, y_tr, y_va, y_te, vocab,
+def run_experiment(X_tr, X_va, X_te, y_tr, y_va, y_te, tokenizer,
                    criterion, lr, batch_size, num_epochs, tag):
-    tr_l, va_l, te_l = make_loaders(X_tr, X_va, X_te, y_tr, y_va, y_te, vocab, batch_size)
-    model     = BiLSTMClassifier(vocab_size=len(vocab)).to(DEVICE)
+    tr_l, va_l, te_l = make_loaders(X_tr, X_va, X_te, y_tr, y_va, y_te, tokenizer, batch_size)
+    model     = BertBiLSTMClassifier(freeze_bert=FREEZE_BERT).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2, factor=0.5)
 
     hist = {"train_loss": [], "train_acc": [], "test_acc": []}
     best_val_acc, best_state = 0, None
 
     print(f"\n[{tag}]  lr={lr}  bs={batch_size}  epochs={num_epochs}")
     for ep in range(1, num_epochs + 1):
-        tl, ta = train_epoch(model, tr_l, criterion, optimizer)
-        vl, va, _, _ = eval_epoch(model, va_l, criterion)
+        tl, ta        = train_epoch(model, tr_l, criterion, optimizer)
+        vl, va, _, _  = eval_epoch(model, va_l, criterion)
         _,  tea, _, _ = eval_epoch(model, te_l, criterion)
         scheduler.step(vl)
         hist["train_loss"].append(tl)
@@ -226,7 +279,7 @@ def run_experiment(X_tr, X_va, X_te, y_tr, y_va, y_te, vocab,
 
 
 # =============================================================
-# 4. PLOTS
+# 5. PLOTS (same style as bilstm_fakenews.py)
 # =============================================================
 
 COLORS = ["#2196F3", "#E91E63", "#4CAF50", "#FF9800", "#9C27B0"]
@@ -277,13 +330,13 @@ def plot_predictions_table(preds, labels, texts, path, n=100):
     tbl.auto_set_font_size(False); tbl.set_fontsize(7.5)
     tbl.auto_set_column_width(list(range(len(df.columns))))
     for j in range(len(df.columns)):
-        tbl[(0,j)].set_facecolor("#1565C0")
+        tbl[(0,j)].set_facecolor("#1A237E")
         tbl[(0,j)].set_text_props(color="white", fontweight="bold")
     for i in range(1, n+1):
         c = "#E8F5E9" if rows[i-1][4]=="✓" else "#FFEBEE"
         for j in range(len(df.columns)):
             tbl[(i,j)].set_facecolor(c)
-    plt.title(f"BiLSTM Predictions – First {n} Test Samples",
+    plt.title(f"BERT+BiLSTM Predictions – First {n} Test Samples",
               fontsize=13, fontweight="bold", pad=12)
     plt.tight_layout()
     plt.savefig(path, dpi=130, bbox_inches="tight"); plt.close()
@@ -291,53 +344,54 @@ def plot_predictions_table(preds, labels, texts, path, n=100):
 
 
 # =============================================================
-# 5. MAIN
+# 6. MAIN
 # =============================================================
 
 if __name__ == "__main__":
 
     X_tr, X_va, X_te, y_tr, y_va, y_te = load_data(CSV_PATH)
-    vocab = build_vocab(X_tr)
-    print(f"Vocab size: {len(vocab)}")
 
-    def exp(criterion, lr=1e-3, bs=32, tag=""):
+    print("\nLoading BERT tokenizer...")
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+
+    def exp(criterion, lr=2e-5, bs=16, tag=""):
         return run_experiment(X_tr, X_va, X_te, y_tr, y_va, y_te,
-                              vocab, criterion, lr, bs, EPOCHS, tag)
+                              tokenizer, criterion, lr, bs, EPOCHS, tag)
 
     # ── Fig 1: BCE baseline ───────────────────────────────
     print("\n" + "="*50 + "\nExp 1 — BCE Loss\n" + "="*50)
     h_bce = exp(nn.BCEWithLogitsLoss(), tag="BCE")
-    plot_single(h_bce, "Fig 1 – BiLSTM | BCE Loss (lr=0.001, bs=32)",
+    plot_single(h_bce, "Fig 1 – BERT+BiLSTM | BCE Loss (lr=2e-5, bs=16)",
                 f"{FIG_DIR}/fig1_bce_baseline.png")
 
     # ── Fig 2: Focal Loss ─────────────────────────────────
     print("\n" + "="*50 + "\nExp 2 — Focal Loss\n" + "="*50)
     h_focal = exp(FocalLoss(), tag="Focal")
-    plot_single(h_focal, "Fig 2 – BiLSTM | Focal Loss (lr=0.001, bs=32)",
+    plot_single(h_focal, "Fig 2 – BERT+BiLSTM | Focal Loss (lr=2e-5, bs=16)",
                 f"{FIG_DIR}/fig2_focal_loss.png")
 
     # ── Fig 3 & 4: Learning Rate ──────────────────────────
     print("\n" + "="*50 + "\nExp 3 — Different LR\n" + "="*50)
     lr_hists = {}
-    for lr in [0.1, 0.01, 0.001, 0.0001]:
+    for lr in [1e-4, 5e-5, 2e-5, 1e-5]:
         lr_hists[f"lr={lr}"] = exp(nn.BCEWithLogitsLoss(), lr=lr, tag=f"lr={lr}")
     plot_multi(lr_hists, "train_loss", "Train Loss",
-               "Fig 3 – BiLSTM Train Loss: Different LR",
+               "Fig 3 – BERT+BiLSTM Train Loss: Different LR",
                f"{FIG_DIR}/fig3_lr_train_loss.png", log_scale=True)
     plot_multi(lr_hists, "test_acc",  "Test Accuracy",
-               "Fig 4 – BiLSTM Test Accuracy: Different LR",
+               "Fig 4 – BERT+BiLSTM Test Accuracy: Different LR",
                f"{FIG_DIR}/fig4_lr_test_acc.png")
 
     # ── Fig 5 & 6: Batch Size ─────────────────────────────
     print("\n" + "="*50 + "\nExp 4 — Different Batch Size\n" + "="*50)
     bs_hists = {}
-    for bs in [8, 16, 32, 64, 128]:
+    for bs in [4, 8, 16, 32]:   # keep small due to BERT memory
         bs_hists[f"bs={bs}"] = exp(nn.BCEWithLogitsLoss(), bs=bs, tag=f"bs={bs}")
     plot_multi(bs_hists, "train_loss", "Train Loss",
-               "Fig 5 – BiLSTM Train Loss: Different Batch Size",
+               "Fig 5 – BERT+BiLSTM Train Loss: Different Batch Size",
                f"{FIG_DIR}/fig5_bs_train_loss.png")
     plot_multi(bs_hists, "test_acc",  "Test Accuracy",
-               "Fig 6 – BiLSTM Test Accuracy: Different Batch Size",
+               "Fig 6 – BERT+BiLSTM Test Accuracy: Different Batch Size",
                f"{FIG_DIR}/fig6_bs_test_acc.png")
 
     # ── Fig 7: Prediction Table ───────────────────────────
@@ -352,7 +406,7 @@ if __name__ == "__main__":
 
     # ── Save results for comparison ───────────────────────
     save_data = {
-        "model": "BiLSTM",
+        "model": "BERT+BiLSTM",
         "bce_train_loss": h_bce["train_loss"],
         "bce_train_acc":  h_bce["train_acc"],
         "bce_test_acc":   h_bce["test_acc"],
@@ -361,7 +415,7 @@ if __name__ == "__main__":
         "final_preds":    h_bce["final_preds"],
         "final_labels":   h_bce["final_labels"],
     }
-    with open(f"{SAVE_DIR}/bilstm_results.json", "w") as f:
+    with open(f"{SAVE_DIR}/bert_bilstm_results.json", "w") as f:
         json.dump(save_data, f, indent=2)
-    print(f"\n✅ BiLSTM done! Results saved to {SAVE_DIR}/bilstm_results.json")
-    print(f"   Now run: python bert_bilstm_fakenews.py")
+    print(f"\n✅ BERT+BiLSTM done! Results saved to {SAVE_DIR}/bert_bilstm_results.json")
+    print(f"   Now run: python compare_models.py")
